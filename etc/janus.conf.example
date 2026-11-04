@@ -7,7 +7,7 @@
 # Leave commented to enable automatic detection from /boot/grub/grub.cfg
 # WINDOWS_GRUB_ENTRY="Windows Boot Manager (on /dev/nvme0n1p1)"
 
-# Backup execution script
+# Backup execution script (used by `janus backup`)
 BACKUP_SCRIPT="/data/scripts/backup-janus.sh"
 
 # Local backup directory to inspect with `janus backup --status`
@@ -17,4 +17,9 @@ BACKUP_DIR="/data/backups/daily"
 RCLONE_REMOTE="janus-backup-encrypted:"
 
 # Space-separated list of storage mount paths to display in `janus status`
-STORAGE_PATHS="/ /data"
+# Leave commented to auto-detect all separate filesystems (/, /data, /home, /mnt/*)
+# STORAGE_PATHS="/ /data"
+
+# Optional: List of specific Docker containers to watch (shows ● if up, ○ if down)
+# If left commented, Janus CLI automatically discovers and displays ALL active containers!
+# WATCHED_CONTAINERS="coolify postgres redis docmost vaultwarden"

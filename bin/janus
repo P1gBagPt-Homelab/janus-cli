@@ -7,7 +7,7 @@
 
 set -eo pipefail
 
-JANUS_VERSION="1.0.0"
+JANUS_VERSION="1.1.0"
 
 # --- Color Definitions ---
 BOLD="\033[1m"
@@ -36,7 +36,26 @@ fi
 BACKUP_SCRIPT="${BACKUP_SCRIPT:-/data/scripts/backup-janus.sh}"
 BACKUP_DIR="${BACKUP_DIR:-/data/backups/daily}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-janus-backup-encrypted:}"
-STORAGE_PATHS="${STORAGE_PATHS:-/ /data}"
+
+# --- Helper: Auto-detect storage mounts ---
+get_storage_paths() {
+    if [[ -n "${STORAGE_PATHS:-}" ]]; then
+        echo "$STORAGE_PATHS"
+        return
+    fi
+    local paths="/"
+    # Detect separate physical filesystems mounted under common paths
+    for candidate in /data /home /mnt/* /media/*; do
+        if [[ -d "$candidate" ]] && df -P "$candidate" >/dev/null 2>&1; then
+            local mount_target
+            mount_target=$(df -P "$candidate" 2>/dev/null | awk 'NR==2 {print $6}' || echo "")
+            if [[ -n "$mount_target" && "$mount_target" != "/" ]] && [[ ! " ${paths} " =~ " ${mount_target} " ]]; then
+                paths="${paths} ${mount_target}"
+            fi
+        fi
+    done
+    echo "$paths"
+}
 
 # --- Helper: Draw Visual Percentage Bar ---
 draw_bar() {
@@ -79,8 +98,8 @@ get_windows_entry() {
         fi
     fi
 
-    # Fallback to standard EFI NVMe default
-    echo "Windows Boot Manager (on /dev/nvme0n1p1)"
+    # Return empty if no Windows entry detected
+    echo ""
 }
 
 # --- ASCII Banner ---
@@ -159,16 +178,18 @@ cmd_status() {
     echo -e "  ${ram_bar}  ${BOLD}${ram_used_gb} GB${RESET} / ${ram_total_gb} GB"
     echo ""
 
-    # 4. Storage Pools
+    # 4. Storage Pools (Dynamic Discovery)
     echo -e "${WHITE}${BOLD}💾 STORAGE POOLS${RESET}"
-    for mount_pt in ${STORAGE_PATHS}; do
+    local active_paths
+    active_paths=$(get_storage_paths)
+    for mount_pt in ${active_paths}; do
         if df -h "$mount_pt" >/dev/null 2>&1; then
             local total used pct bar
             total=$(df -h "$mount_pt" | awk 'NR==2 {print $2}')
             used=$(df -h "$mount_pt" | awk 'NR==2 {print $3}')
             pct=$(df -h "$mount_pt" | awk 'NR==2 {print $5}' | tr -d '%')
             bar=$(draw_bar "$pct" 18)
-            printf "  ${DIM}%-16s${RESET} %s  ${BOLD}%s${RESET} / %s\n" "Mount ($mount_pt):" "$bar" "$used" "$total"
+            printf "  ${DIM}%-18s${RESET} %s  ${BOLD}%s${RESET} / %s\n" "Mount ($mount_pt):" "$bar" "$used" "$total"
         fi
     done
     echo ""
@@ -221,29 +242,81 @@ cmd_status() {
         echo ""
     fi
 
-    # 6. Docker & Homelab Containers
+    # 6. Docker & Homelab Containers (Dynamic Auto-Discovery)
     if command -v docker >/dev/null 2>&1; then
-        echo -e "${WHITE}${BOLD}🐳 HOMELAB CONTAINERS${RESET}"
+        echo -e "${WHITE}${BOLD}🐳 DOCKER & HOMELAB CONTAINERS${RESET}"
         local running_cnt total_cnt
         running_cnt=$(docker ps -q 2>/dev/null | wc -l || echo "0")
         total_cnt=$(docker ps -aq 2>/dev/null | wc -l || echo "0")
-        echo -e "  ${DIM}Containers:${RESET} ${GREEN}${running_cnt} Running${RESET} / ${total_cnt} Total"
-        
-        local services=("coolify" "coolify-proxy" "postgres" "redis" "docmost" "vaultwarden" "janusdeck" "minio" "rabbitmq" "ollama" "open-webui" "uptime-kuma" "netdata" "jellyfin" "glitchtip" "wg-easy")
-        printf "  "
-        local col=0
-        for svc in "${services[@]}"; do
-            if docker ps --format '{{.Names}}' 2>/dev/null | grep -qi "$svc"; then
-                printf "${GREEN}● %-14s${RESET} " "$svc"
+        echo -e "  ${DIM}Overview:${RESET} ${GREEN}${running_cnt} Running${RESET} / ${total_cnt} Total"
+
+        if [[ -n "${WATCHED_CONTAINERS:-}" ]]; then
+            # Pinned custom list of watched containers from janus.conf
+            printf "  "
+            local col=0
+            for svc in ${WATCHED_CONTAINERS}; do
+                if docker ps --format '{{.Names}}' 2>/dev/null | grep -qi "$svc"; then
+                    printf "${GREEN}● %-18s${RESET} " "$svc"
+                else
+                    printf "${DIM}○ %-18s${RESET} " "$svc"
+                fi
+                col=$((col + 1))
+                if (( col % 4 == 0 )); then
+                    printf "\n  "
+                fi
+            done
+            if (( col % 4 != 0 )); then printf "\n"; fi
+        else
+            # 100% Dynamic Discovery: display actual running containers
+            local running_containers=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && running_containers+=("$line")
+            done < <(docker ps --format '{{.Names}}' 2>/dev/null | sort || true)
+
+            if (( ${#running_containers[@]} > 0 )); then
+                printf "  "
+                local col=0
+                for c_name in "${running_containers[@]}"; do
+                    local display_name="$c_name"
+                    if (( ${#display_name} > 20 )); then
+                        display_name="${display_name:0:17}..."
+                    fi
+                    printf "${GREEN}● %-20s${RESET} " "$display_name"
+                    col=$((col + 1))
+                    if (( col % 3 == 0 )); then
+                        printf "\n  "
+                    fi
+                done
+                if (( col % 3 != 0 )); then printf "\n"; fi
             else
-                printf "${DIM}○ %-14s${RESET} " "$svc"
+                echo -e "  ${DIM}No active containers currently running.${RESET}"
             fi
-            col=$((col + 1))
-            if (( col % 4 == 0 )); then
-                printf "\n  "
+
+            # List stopped / exited containers if any exist
+            local stopped_containers=()
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && stopped_containers+=("$line")
+            done < <(docker ps -a --filter "status=exited" --filter "status=dead" --format '{{.Names}}' 2>/dev/null | sort || true)
+
+            if (( ${#stopped_containers[@]} > 0 )); then
+                echo -e "  ${DIM}Stopped / Exited (${#stopped_containers[@]}):${RESET}"
+                printf "  "
+                local col=0
+                for c_name in "${stopped_containers[@]}"; do
+                    local display_name="$c_name"
+                    if (( ${#display_name} > 20 )); then
+                        display_name="${display_name:0:17}..."
+                    fi
+                    printf "${DIM}○ %-20s${RESET} " "$display_name"
+                    col=$((col + 1))
+                    if (( col % 3 == 0 )); then
+                        printf "\n  "
+                    fi
+                done
+                if (( col % 3 != 0 )); then printf "\n"; fi
             fi
-        done
-        echo -e "\n"
+        fi
+        echo ""
     fi
 
     # 7. WireGuard & Firewall Status
@@ -277,6 +350,13 @@ cmd_to_windows() {
 
     local win_entry
     win_entry=$(get_windows_entry)
+
+    if [[ -z "$win_entry" ]]; then
+        echo -e "${RED}Error: No 'Windows Boot Manager' entry detected in /boot/grub/grub.cfg.${RESET}"
+        echo -e "If this server is configured for dual-booting, you can explicitly define your GRUB entry in /etc/janus/janus.conf:"
+        echo -e "  WINDOWS_GRUB_ENTRY=\"Windows Boot Manager (on /dev/nvme0n1p1)\"\n"
+        return 1
+    fi
 
     echo -e "Target GRUB Entry: ${BOLD}${CYAN}${win_entry}${RESET}"
     echo -e "This will set a ${CYAN}one-time next boot${RESET} to Windows Gaming Rig via ${BOLD}grub-reboot${RESET}."
