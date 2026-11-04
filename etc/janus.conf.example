@@ -1,0 +1,20 @@
+# ==============================================================================
+# Janus CLI Configuration File
+# Copy to /etc/janus/janus.conf or ~/.janusrc
+# ==============================================================================
+
+# Target GRUB entry for 1-click Windows switch
+# Leave commented to enable automatic detection from /boot/grub/grub.cfg
+# WINDOWS_GRUB_ENTRY="Windows Boot Manager (on /dev/nvme0n1p1)"
+
+# Backup execution script
+BACKUP_SCRIPT="/data/scripts/backup-janus.sh"
+
+# Local backup directory to inspect with `janus backup --status`
+BACKUP_DIR="/data/backups/daily"
+
+# Encrypted cloud remote name (Rclone)
+RCLONE_REMOTE="janus-backup-encrypted:"
+
+# Space-separated list of storage mount paths to display in `janus status`
+STORAGE_PATHS="/ /data"
