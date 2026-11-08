@@ -69,10 +69,10 @@ sudo dpkg -i janus-cli_*_all.deb
 
 | Command | Description |
 | :--- | :--- |
-| `janus status` | Full hardware, GPU, Docker, and WireGuard telemetry dashboard. |
+| `janus status` | Full hardware, GPU, Docker, WireGuard, and automated backup status dashboard. |
 | `janus to-windows` | Safe 1-click reboot to Windows Gaming Rig (auto-reverts to Linux). |
-| `janus backup` | Executes automated snapshot and encrypted cloud sync. |
-| `janus backup --status` | Inspects recent local backup snapshots and cloud storage quota. |
+| `janus backup` / `janus backup status` | Inspects whether today's backup was completed, lists all local snapshots with sizes & dates, and checks cloud remote storage. |
+| `janus backup run` / `janus backup --force` | Executes automated snapshot and encrypted cloud sync (with force override). |
 | `janus logs <service>` | Tails live logs for any container matching the keyword (e.g. `docmost`). |
 | `janus restart <svc>` | Restarts a Docker container or systemd service. |
 | `janus update` | Runs APT security updates, kernel patches, and prunes unused Docker cache. |

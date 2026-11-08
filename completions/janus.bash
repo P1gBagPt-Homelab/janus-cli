@@ -15,7 +15,7 @@ _janus() {
             return 0
             ;;
         backup)
-            local backup_opts="--status -s"
+            local backup_opts="status list --status -s run --run --force -f"
             COMPREPLY=( $(compgen -W "$backup_opts" -- "$cur") )
             return 0
             ;;
