@@ -7,7 +7,7 @@
 
 set -eo pipefail
 
-JANUS_VERSION="1.2.0"
+JANUS_VERSION="1.2.1"
 
 # --- Color Definitions ---
 BOLD="\033[1m"
@@ -36,6 +36,8 @@ fi
 BACKUP_SCRIPT="${BACKUP_SCRIPT:-/data/scripts/backup-janus.sh}"
 BACKUP_DIR="${BACKUP_DIR:-/data/backups/daily}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-janus-backup-encrypted:}"
+WIREGUARD_CONTAINER="${WIREGUARD_CONTAINER:-}"
+WIREGUARD_INTERFACE="${WIREGUARD_INTERFACE:-}"
 
 # --- Helper: Auto-detect storage mounts ---
 get_storage_paths() {
@@ -178,6 +180,145 @@ get_backup_info() {
     fi
 }
 
+# --- Helper: Inspect WireGuard status (Host & Docker / wg-easy) ---
+get_wireguard_info() {
+    WG_ACTIVE=false
+    WG_IP="Not active"
+    WG_PEERS_COUNT=0
+    WG_SOURCE=""
+    WG_CONTAINER=""
+    WG_STATUS_MSG="Not running"
+
+    # 1. Check host WireGuard
+    local host_iface="${WIREGUARD_INTERFACE:-}"
+    if command -v wg >/dev/null 2>&1; then
+        local wg_out=""
+        if [[ $EUID -eq 0 ]]; then
+            wg_out=$(wg show 2>/dev/null || true)
+        else
+            wg_out=$(sudo -n wg show 2>/dev/null || sudo wg show 2>/dev/null || true)
+        fi
+
+        if [[ -n "$wg_out" ]]; then
+            WG_ACTIVE=true
+            WG_SOURCE="host"
+            if [[ -z "$host_iface" ]]; then
+                if [[ $EUID -eq 0 ]]; then
+                    host_iface=$(wg show interfaces 2>/dev/null | awk '{print $1}')
+                else
+                    host_iface=$(sudo -n wg show interfaces 2>/dev/null || sudo wg show interfaces 2>/dev/null || true)
+                    host_iface=$(echo "$host_iface" | awk '{print $1}')
+                fi
+            fi
+            
+            # Count registered peer keys
+            local count
+            count=$(echo "$wg_out" | grep -c '^[ \t]*peer:' || echo "0")
+            WG_PEERS_COUNT=$((count + 0))
+        fi
+    fi
+
+    # Fallback to ip link on host if wg binary was not available or had no output
+    if [[ "$WG_ACTIVE" != "true" && -z "$host_iface" ]]; then
+        if command -v ip >/dev/null 2>&1; then
+            host_iface=$(ip -o link show 2>/dev/null | grep -E '^[0-9]+: *wg[0-9a-zA-Z_-]*:' | awk -F': ' '{print $2}' | head -n1 || true)
+        fi
+    fi
+
+    if [[ -n "$host_iface" ]]; then
+        local host_ip=""
+        if command -v ip >/dev/null 2>&1; then
+            host_ip=$(ip -4 addr show "$host_iface" 2>/dev/null | grep -w inet | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+        fi
+        if [[ -n "$host_ip" ]]; then
+            WG_ACTIVE=true
+            WG_SOURCE="host"
+            WG_IP="$host_ip"
+        fi
+    fi
+
+    if [[ "$WG_ACTIVE" == "true" && "$WG_SOURCE" == "host" ]]; then
+        local s=""
+        [[ "$WG_PEERS_COUNT" -ne 1 ]] && s="s"
+        WG_STATUS_MSG="Active (${WG_PEERS_COUNT} registered client key${s})"
+        return
+    fi
+
+    # 2. Check Docker for wg-easy or WireGuard containers
+    if command -v docker >/dev/null 2>&1; then
+        local docker_cmd="docker"
+        if ! docker ps >/dev/null 2>&1; then
+            if sudo -n docker ps >/dev/null 2>&1; then
+                docker_cmd="sudo -n docker"
+            fi
+        fi
+
+        local wg_c="${WIREGUARD_CONTAINER:-}"
+        if [[ -z "$wg_c" ]]; then
+            # Search running containers for wg-easy or wireguard
+            wg_c=$($docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -E '^wg-easy$' | head -n1 || true)
+            if [[ -z "$wg_c" ]]; then
+                wg_c=$($docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -Ei 'wg-easy|wireguard' | head -n1 || true)
+            fi
+        else
+            # Verify specified container is running
+            if ! $docker_cmd ps --format '{{.Names}}' 2>/dev/null | grep -q "^${wg_c}$"; then
+                wg_c=""
+            fi
+        fi
+
+        if [[ -n "$wg_c" ]]; then
+            WG_CONTAINER="$wg_c"
+            
+            # Inspect WireGuard inside container
+            local c_wg_out=""
+            c_wg_out=$($docker_cmd exec "$wg_c" wg show 2>/dev/null | tr -d '\r' || true)
+
+            # Discover interface inside container (usually wg0)
+            local c_iface=""
+            c_iface=$($docker_cmd exec "$wg_c" wg show interfaces 2>/dev/null | tr -d '\r' | awk '{print $1}' || true)
+            [[ -z "$c_iface" ]] && c_iface="wg0"
+
+            # Get IP inside container
+            local c_ip=""
+            c_ip=$($docker_cmd exec "$wg_c" ip -4 addr show "$c_iface" 2>/dev/null | tr -d '\r' | grep -w inet | awk '{print $2}' | cut -d/ -f1 | head -n1 || true)
+            if [[ -z "$c_ip" ]]; then
+                c_ip=$($docker_cmd exec "$wg_c" grep -i '^[ \t]*Address' "/etc/wireguard/${c_iface}.conf" 2>/dev/null | tr -d '\r' | awk -F'=' '{print $2}' | cut -d/ -f1 | tr -d ' ' | head -n1 || true)
+            fi
+
+            # Count registered peers
+            local c_peers=0
+            if [[ -n "$c_wg_out" ]]; then
+                c_peers=$(echo "$c_wg_out" | grep -c '^[ \t]*peer:' || echo "0")
+            fi
+            if (( c_peers == 0 )); then
+                local conf_peers
+                conf_peers=$($docker_cmd exec "$wg_c" grep -c '^[ \t]*\[Peer\]' "/etc/wireguard/${c_iface}.conf" 2>/dev/null | tr -d '\r' || echo "0")
+                if (( conf_peers > 0 )); then
+                    c_peers=$conf_peers
+                fi
+            fi
+
+            WG_ACTIVE=true
+            WG_SOURCE="docker"
+            WG_PEERS_COUNT=$((c_peers + 0))
+            [[ -n "$c_ip" ]] && WG_IP="$c_ip"
+
+            local s=""
+            [[ "$WG_PEERS_COUNT" -ne 1 ]] && s="s"
+            WG_STATUS_MSG="Active (${WG_PEERS_COUNT} registered client key${s} • Docker: ${WG_CONTAINER})"
+            return
+        fi
+    fi
+
+    # 3. Status message when inactive
+    if command -v wg >/dev/null 2>&1 && [[ $EUID -ne 0 ]]; then
+        WG_STATUS_MSG="Not running or requires sudo for wg status"
+    else
+        WG_STATUS_MSG="Not running"
+    fi
+}
+
 # --- ASCII Banner ---
 banner() {
     echo -e "${CYAN}${BOLD}"
@@ -198,6 +339,9 @@ EOF
 cmd_status() {
     banner
 
+    # WireGuard Telemetry
+    get_wireguard_info
+
     # 1. System Overview
     local hostname
     hostname=$(hostname)
@@ -205,10 +349,11 @@ cmd_status() {
     uptime_str=$(uptime -p 2>/dev/null || uptime | awk -F'( |,|:)+' '{print $6,"hrs",$7,"min"}')
     local kernel
     kernel=$(uname -r)
-    local ip_lan
-    ip_lan=$(ip -4 addr show scope global | grep inet | awk '{print $2}' | cut -d/ -f1 | head -n1 || echo "Unknown")
-    local ip_wg
-    ip_wg=$(ip -4 addr show wg0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 || echo "Not active")
+    local ip_lan="Unknown"
+    if command -v ip >/dev/null 2>&1; then
+        ip_lan=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -n1 || echo "Unknown")
+    fi
+    local ip_wg="${WG_IP}"
 
     echo -e "${WHITE}${BOLD}🖥️  SYSTEM OVERVIEW${RESET}"
     echo -e "  ${DIM}Host:${RESET}     ${BOLD}${hostname}${RESET}  |  ${DIM}Uptime:${RESET} ${uptime_str}"
@@ -397,17 +542,16 @@ cmd_status() {
 
     # 7. WireGuard & Firewall Status
     echo -e "${WHITE}${BOLD}🛡️  NETWORK PERIMETER & FIREWALL${RESET}"
-    if command -v wg >/dev/null 2>&1 && sudo wg show >/dev/null 2>&1; then
-        local peers_cnt
-        peers_cnt=$(sudo wg show all dump 2>/dev/null | grep -v "private-key" | wc -l || echo "0")
-        echo -e "  ${DIM}WireGuard:${RESET} ${GREEN}Active${RESET} (${peers_cnt} registered client keys)"
+    if [[ "$WG_ACTIVE" == "true" ]]; then
+        echo -e "  ${DIM}WireGuard:${RESET} ${GREEN}${WG_STATUS_MSG}${RESET}"
     else
-        echo -e "  ${DIM}WireGuard:${RESET} ${YELLOW}Not running or requires sudo for wg status${RESET}"
+        echo -e "  ${DIM}WireGuard:${RESET} ${YELLOW}${WG_STATUS_MSG}${RESET}"
     fi
 
     if command -v ufw >/dev/null 2>&1; then
         local ufw_status
-        ufw_status=$(sudo ufw status | grep "Status:" | awk '{print $2}' || echo "unknown")
+        ufw_status=$(sudo -n ufw status 2>/dev/null || sudo ufw status 2>/dev/null || true)
+        ufw_status=$(echo "$ufw_status" | grep "Status:" | awk '{print $2}' || echo "unknown")
         if [[ "$ufw_status" == "active" ]]; then
             echo -e "  ${DIM}UFW:${RESET}       ${GREEN}Active (Default Deny Incoming)${RESET}"
         else

@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.2.1}"
 PKG_NAME="janus-cli"
 BUILD_DIR="${ROOT_DIR}/build/${PKG_NAME}_${VERSION}_all"
 DIST_DIR="${ROOT_DIR}/dist"

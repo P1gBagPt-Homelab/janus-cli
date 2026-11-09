@@ -23,3 +23,9 @@ RCLONE_REMOTE="janus-backup-encrypted:"
 # Optional: List of specific Docker containers to watch (shows ● if up, ○ if down)
 # If left commented, Janus CLI automatically discovers and displays ALL active containers!
 # WATCHED_CONTAINERS="coolify postgres redis docmost vaultwarden"
+
+# Optional: Override WireGuard Docker container name (defaults to auto-detecting wg-easy or wireguard)
+# WIREGUARD_CONTAINER="wg-easy"
+
+# Optional: Override WireGuard interface name (defaults to auto-detecting wg0, wg*, etc.)
+# WIREGUARD_INTERFACE="wg0"
